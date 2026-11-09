@@ -16,7 +16,8 @@ from typing import Any, Protocol, override, runtime_checkable
 from deerflow_extension_api import CompactionEvent, ExtensionData, canonical_hash, task_store_from_runtime
 from langchain.agents import AgentState
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, SystemMessage, get_buffer_string
+from langchain_core.runnables import RunnableBinding
 from langgraph.config import get_config
 from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -32,6 +33,7 @@ from deerflow.config.task_continuity_config import TaskContinuityConfig
 from deerflow.extensions.notify import notify_context_compacted
 from deerflow.models import create_chat_model
 from deerflow.models.reasoning import resolve_reasoning_contract
+from deerflow.models.vllm_provider import VllmChatModel, _pick_reasoning, _reasoning_to_text
 from deerflow.runtime.events.catalog import MIDDLEWARE_SUMMARIZE_TAG
 from deerflow.utils.assembly_io import run_assembly
 
@@ -87,6 +89,44 @@ def _summary_message(message: AnyMessage) -> AnyMessage:
         content.append({"type": "text", "text": text} if text is not None else block)
         changed = changed or text is not None
     return message.model_copy(update={"content": content}) if changed else message
+
+
+def _with_replayed_reasoning(message: Any) -> Any:
+    """Fold the reasoning a provider sends back on the next request into the counted text."""
+    if not isinstance(message, AIMessage):
+        return message
+    reasoning = _pick_reasoning(message.additional_kwargs)
+    text = _reasoning_to_text(reasoning) if reasoning is not None else ""
+    if not text:
+        return message
+    if isinstance(message.content, str):
+        content: Any = message.content + text
+    elif isinstance(message.content, list):
+        content = [*message.content, {"type": "text", "text": text}]
+    else:
+        return message
+    return message.model_copy(update={"content": content})
+
+
+def _counts_replayed_reasoning(counter: Any) -> Any:
+    """Wrap a LangChain token counter so replayed reasoning is counted.
+
+    ``count_tokens_approximately`` reads only ``content`` and ``tool_calls``, but
+    ``VllmChatModel`` echoes ``additional_kwargs["reasoning"]`` back to vLLM, which
+    bills it as prompt tokens. Without this, token triggers undercount reasoning
+    models and compaction fires too late (#8074).
+    """
+
+    def count(messages: Any, **kwargs: Any) -> int:
+        return counter([_with_replayed_reasoning(message) for message in messages], **kwargs)
+
+    return count
+
+
+def _replays_reasoning(model: Any) -> bool:
+    while isinstance(model, RunnableBinding):  # with_config() / bind() wrappers
+        model = model.bound
+    return isinstance(model, VllmChatModel)
 
 
 class _ReusedSummary(str):
@@ -177,6 +217,9 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        if "token_counter" not in kwargs and _replays_reasoning(self.model):
+            self.token_counter = _counts_replayed_reasoning(self.token_counter)
+            self._partial_token_counter = _counts_replayed_reasoning(self._partial_token_counter)
         self._task_continuity_config = task_continuity_config if task_continuity_config is not None and task_continuity_config.enabled is True else None
         self._before_summarization_hooks = before_summarization or []
         # Model-ownership state. The model that actually executes the run is selected

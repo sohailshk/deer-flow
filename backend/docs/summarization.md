@@ -282,6 +282,7 @@ The default LangChain prompt instructs the model to:
 - Uses approximate token counting based on character count
 - For Anthropic models: ~3.3 characters per token
 - For other models: Uses LangChain's default estimation
+- For `VllmChatModel` the count includes the reasoning it replays to vLLM (`additional_kwargs["reasoning"]`, else `reasoning_content`)
 - Can be customized with a custom `token_counter` function
 
 ### Message Preservation
